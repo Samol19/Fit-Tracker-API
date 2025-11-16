@@ -166,108 +166,62 @@ def calculate_statistics(data: List[dict], base_features: List[str]) -> np.ndarr
     return np.array(features)
 
 async def predict_with_pushup(websocket: WebSocket):
-    """Handler específico para pushup con detección de picos"""
+    """Handler para pushup - solo clasifica frames enviados por el cliente"""
     model_data = models["pushup"]
     model = model_data["model"]
     scaler = model_data["scaler"]
     encoder = model_data["encoder"]
     sensitivity = model_data["sensitivity"]
     base_features = BASE_FEATURES["pushup"]
-    config = BUFFER_CONFIG["pushup"]
-    
-    # Buffer circular para acumular frames
-    buffer = deque(maxlen=config["size"])
-    signal_buffer = deque(maxlen=config["size"])
-    rep_count = 0
-    last_peak_idx = -config["min_peak_distance"]
     
     try:
         while True:
             t0 = time.perf_counter()
             data = await websocket.receive_json()
-            t1 = time.perf_counter()
             
-            # Validar que vengan las 6 features base
-            if "metrics" not in data:
-                await websocket.send_json({"error": "Falta campo 'metrics'"})
+            # El cliente envía un array de frames cuando detecta una repetición
+            if "frames" not in data:
+                await websocket.send_json({"error": "Falta campo 'frames' (array de frames)"})
                 continue
             
-            metrics = data["metrics"]
-            if len(metrics) != len(base_features):
+            frames = data["frames"]
+            if not isinstance(frames, list) or len(frames) == 0:
+                await websocket.send_json({"error": "'frames' debe ser un array no vacío"})
+                continue
+            
+            # Validar que cada frame tenga las features base correctas
+            for i, frame in enumerate(frames):
+                missing = [f for f in base_features if f not in frame]
+                if missing:
+                    await websocket.send_json({
+                        "error": f"Frame {i} falta features: {missing}"
+                    })
+                    break
+            else:
+                # Calcular estadísticas sobre todos los frames
+                features = calculate_statistics(frames, base_features)
+                features_scaled = scaler.transform(features.reshape(1, -1))
+                
+                # Predicción con sensibilidad aplicada
+                proba = model.predict_proba(features_scaled)[0]
+                sens_multipliers = np.array([sensitivity.get(cls, 1.0) for cls in encoder.classes_])
+                adjusted_proba = proba * sens_multipliers
+                adjusted_proba = adjusted_proba / adjusted_proba.sum()
+                
+                pred_idx = int(np.argmax(adjusted_proba))
+                pred_label = encoder.classes_[pred_idx]
+                confidence = float(adjusted_proba[pred_idx])
+                
+                t1 = time.perf_counter()
+                
                 await websocket.send_json({
-                    "error": f"Se esperan {len(base_features)} features base, recibidas: {len(metrics)}"
+                    "type": "classification",
+                    "prediction": pred_label,
+                    "confidence": confidence,
+                    "probabilities": {cls: float(prob) for cls, prob in zip(encoder.classes_, adjusted_proba)},
+                    "frames_received": len(frames),
+                    "timing": {"total_ms": round((t1-t0)*1000, 2)}
                 })
-                continue
-            
-            # Agregar al buffer
-            buffer.append(metrics)
-            signal_buffer.append(metrics["shoulder_wrist_vertical_diff"])
-            
-            # Detección de picos si hay suficientes frames
-            if len(signal_buffer) >= 50:
-                signal = np.array(signal_buffer)
-                smoothed = savgol_filter(signal, min(11, len(signal) if len(signal) % 2 == 1 else len(signal)-1), 3)
-                
-                signal_min = np.min(smoothed)
-                signal_max = np.max(smoothed)
-                signal_range = signal_max - signal_min
-                
-                if signal_range > 0.05:  # Validación mínima
-                    height_threshold = signal_min + (signal_range * 0.40)
-                    prominence_min = max(signal_range * 0.10, config["min_prominence"])
-                    
-                    peaks, _ = find_peaks(
-                        smoothed,
-                        height=height_threshold,
-                        distance=config["min_peak_distance"],
-                        prominence=prominence_min
-                    )
-                    
-                    # Verificar nuevos picos
-                    for peak_idx in peaks:
-                        if peak_idx > last_peak_idx + config["min_peak_distance"]:
-                            # Extraer ventana alrededor del pico
-                            start = max(0, peak_idx - config["window_margin"])
-                            end = min(len(buffer), peak_idx + config["window_margin"])
-                            
-                            if end - start >= 30:  # Mínimo 30 frames
-                                window_data = list(buffer)[start:end]
-                                
-                                # Calcular estadísticas
-                                features = calculate_statistics(window_data, base_features)
-                                features_scaled = scaler.transform(features.reshape(1, -1))
-                                
-                                # Predicción con sensibilidad
-                                proba = model.predict_proba(features_scaled)[0]
-                                sens_multipliers = np.array([sensitivity.get(cls, 1.0) for cls in encoder.classes_])
-                                adjusted_proba = proba * sens_multipliers
-                                adjusted_proba = adjusted_proba / adjusted_proba.sum()
-                                
-                                pred_idx = int(np.argmax(adjusted_proba))
-                                pred_label = encoder.classes_[pred_idx]
-                                confidence = float(adjusted_proba[pred_idx])
-                                
-                                rep_count += 1
-                                last_peak_idx = peak_idx
-                                
-                                t2 = time.perf_counter()
-                                
-                                await websocket.send_json({
-                                    "type": "repetition",
-                                    "rep_number": rep_count,
-                                    "prediction": pred_label,
-                                    "confidence": confidence,
-                                    "probabilities": {cls: float(prob) for cls, prob in zip(encoder.classes_, adjusted_proba)},
-                                    "timing": {"total_ms": round((t2-t0)*1000, 2)}
-                                })
-                                continue
-            
-            # Respuesta de estado (sin repetición detectada)
-            await websocket.send_json({
-                "type": "status",
-                "buffer_size": len(buffer),
-                "ready": len(signal_buffer) >= 50
-            })
             
     except WebSocketDisconnect:
         print(f"Cliente desconectado de pushup")
@@ -281,7 +235,7 @@ async def predict_with_pushup(websocket: WebSocket):
             pass
 
 async def predict_with_squat(websocket: WebSocket):
-    """Handler específico para squat con máquina de estados"""
+    """Handler para squat - solo clasifica frames enviados por el cliente"""
     model_data = models["squat"]
     model = model_data["model"]
     scaler = model_data["scaler"]
@@ -289,93 +243,54 @@ async def predict_with_squat(websocket: WebSocket):
     sensitivity = model_data["sensitivity"]
     base_features = BASE_FEATURES["squat"]
     
-    # Estado de la máquina
-    estado = "ARRIBA"
-    frame_buffer = []
-    rep_count = 0
-    
-    # Umbrales
-    KNEE_ANGLE_DOWN = 160
-    KNEE_ANGLE_UP = 170
-    KNEE_ANGLE_BOTTOM = 90
-    
     try:
         while True:
             t0 = time.perf_counter()
             data = await websocket.receive_json()
-            t1 = time.perf_counter()
             
-            # Validar métricas
-            if "metrics" not in data:
-                await websocket.send_json({"error": "Falta campo 'metrics'"})
+            # El cliente envía un array de frames cuando detecta una repetición
+            if "frames" not in data:
+                await websocket.send_json({"error": "Falta campo 'frames' (array de frames)"})
                 continue
             
-            metrics = data["metrics"]
-            if len(metrics) != len(base_features):
-                await websocket.send_json({
-                    "error": f"Se esperan {len(base_features)} features base"
-                })
+            frames = data["frames"]
+            if not isinstance(frames, list) or len(frames) == 0:
+                await websocket.send_json({"error": "'frames' debe ser un array no vacío"})
                 continue
             
-            knee_angle = metrics["avg_knee_angle"]
-            
-            # Máquina de estados
-            if estado == "ARRIBA" and knee_angle < KNEE_ANGLE_DOWN:
-                estado = "BAJANDO"
-                frame_buffer = [metrics]
+            # Validar que cada frame tenga las features base correctas
+            for i, frame in enumerate(frames):
+                missing = [f for f in base_features if f not in frame]
+                if missing:
+                    await websocket.send_json({
+                        "error": f"Frame {i} falta features: {missing}"
+                    })
+                    break
+            else:
+                # Calcular estadísticas sobre todos los frames
+                features = calculate_statistics(frames, base_features)
+                features_scaled = scaler.transform(features.reshape(1, -1))
                 
-            elif estado == "BAJANDO":
-                frame_buffer.append(metrics)
-                if knee_angle < KNEE_ANGLE_BOTTOM:
-                    estado = "ABAJO"
-                    
-            elif estado == "ABAJO":
-                frame_buffer.append(metrics)
-                if knee_angle > KNEE_ANGLE_DOWN:
-                    estado = "SUBIENDO"
-                    
-            elif estado == "SUBIENDO":
-                frame_buffer.append(metrics)
-                if knee_angle > KNEE_ANGLE_UP:
-                    # REPETICIÓN COMPLETA
-                    estado = "ARRIBA"
-                    rep_count += 1
-                    
-                    if len(frame_buffer) >= 45:  # Mínimo 45 frames
-                        # Calcular estadísticas
-                        features = calculate_statistics(frame_buffer, base_features)
-                        features_scaled = scaler.transform(features.reshape(1, -1))
-                        
-                        # Predicción con sensibilidad
-                        proba = model.predict_proba(features_scaled)[0]
-                        sens_multipliers = np.array([sensitivity.get(cls, 1.0) for cls in encoder.classes_])
-                        adjusted_proba = proba * sens_multipliers
-                        adjusted_proba = adjusted_proba / adjusted_proba.sum()
-                        
-                        pred_idx = int(np.argmax(adjusted_proba))
-                        pred_label = encoder.classes_[pred_idx]
-                        confidence = float(adjusted_proba[pred_idx])
-                        
-                        t2 = time.perf_counter()
-                        
-                        await websocket.send_json({
-                            "type": "repetition",
-                            "rep_number": rep_count,
-                            "prediction": pred_label,
-                            "confidence": confidence,
-                            "probabilities": {cls: float(prob) for cls, prob in zip(encoder.classes_, adjusted_proba)},
-                            "frame_count": len(frame_buffer),
-                            "timing": {"total_ms": round((t2-t0)*1000, 2)}
-                        })
-                        continue
-            
-            # Estado intermedio
-            await websocket.send_json({
-                "type": "status",
-                "state": estado,
-                "knee_angle": float(knee_angle),
-                "frames_accumulated": len(frame_buffer)
-            })
+                # Predicción con sensibilidad aplicada
+                proba = model.predict_proba(features_scaled)[0]
+                sens_multipliers = np.array([sensitivity.get(cls, 1.0) for cls in encoder.classes_])
+                adjusted_proba = proba * sens_multipliers
+                adjusted_proba = adjusted_proba / adjusted_proba.sum()
+                
+                pred_idx = int(np.argmax(adjusted_proba))
+                pred_label = encoder.classes_[pred_idx]
+                confidence = float(adjusted_proba[pred_idx])
+                
+                t1 = time.perf_counter()
+                
+                await websocket.send_json({
+                    "type": "classification",
+                    "prediction": pred_label,
+                    "confidence": confidence,
+                    "probabilities": {cls: float(prob) for cls, prob in zip(encoder.classes_, adjusted_proba)},
+                    "frames_received": len(frames),
+                    "timing": {"total_ms": round((t1-t0)*1000, 2)}
+                })
             
     except WebSocketDisconnect:
         print(f"Cliente desconectado de squat")
@@ -389,46 +304,43 @@ async def predict_with_squat(websocket: WebSocket):
             pass
 
 async def predict_with_plank(websocket: WebSocket):
-    """Handler específico para plank con buffer temporal"""
+    """Handler para plank - solo clasifica frames enviados por el cliente"""
     model_data = models["plank"]
     model = model_data["model"]
     scaler = model_data["scaler"]
     encoder = model_data["encoder"]
     sensitivity = model_data["sensitivity"]
     base_features = BASE_FEATURES["plank"]
-    config = BUFFER_CONFIG["plank"]
-    
-    # Buffer para acumular métricas base de cada frame
-    buffer = deque(maxlen=config["size"])
     
     try:
         while True:
             t0 = time.perf_counter()
             data = await websocket.receive_json()
-            t1 = time.perf_counter()
             
-            # Validar que vengan las 5 métricas base
-            if "metrics" not in data:
-                await websocket.send_json({"error": "Falta campo 'metrics'"})
+            # El cliente envía un array de frames
+            if "frames" not in data:
+                await websocket.send_json({"error": "Falta campo 'frames' (array de frames)"})
                 continue
             
-            metrics = data["metrics"]
-            if len(metrics) != len(base_features):
-                await websocket.send_json({
-                    "error": f"Se esperan {len(base_features)} features base, recibidas: {len(metrics)}"
-                })
+            frames = data["frames"]
+            if not isinstance(frames, list) or len(frames) == 0:
+                await websocket.send_json({"error": "'frames' debe ser un array no vacío"})
                 continue
             
-            # Agregar al buffer
-            buffer.append(metrics)
-            
-            # Si el buffer está lleno, clasificar
-            if len(buffer) == config["size"]:
-                # Calcular estadísticas sobre el buffer completo
-                features = calculate_statistics(list(buffer), base_features)
+            # Validar que cada frame tenga las features base correctas
+            for i, frame in enumerate(frames):
+                missing = [f for f in base_features if f not in frame]
+                if missing:
+                    await websocket.send_json({
+                        "error": f"Frame {i} falta features: {missing}"
+                    })
+                    break
+            else:
+                # Calcular estadísticas sobre todos los frames
+                features = calculate_statistics(frames, base_features)
                 features_scaled = scaler.transform(features.reshape(1, -1))
                 
-                # Predicción con sensibilidad
+                # Predicción con sensibilidad aplicada
                 proba = model.predict_proba(features_scaled)[0]
                 sens_multipliers = np.array([sensitivity.get(cls, 1.0) for cls in encoder.classes_])
                 adjusted_proba = proba * sens_multipliers
@@ -438,21 +350,15 @@ async def predict_with_plank(websocket: WebSocket):
                 pred_label = encoder.classes_[pred_idx]
                 confidence = float(adjusted_proba[pred_idx])
                 
-                t2 = time.perf_counter()
+                t1 = time.perf_counter()
                 
                 await websocket.send_json({
                     "type": "classification",
                     "prediction": pred_label,
                     "confidence": confidence,
                     "probabilities": {cls: float(prob) for cls, prob in zip(encoder.classes_, adjusted_proba)},
-                    "timing": {"total_ms": round((t2-t0)*1000, 2)}
-                })
-            else:
-                # Buffer llenándose
-                await websocket.send_json({
-                    "type": "status",
-                    "buffer_size": len(buffer),
-                    "buffer_progress": len(buffer) / config["size"]
+                    "frames_received": len(frames),
+                    "timing": {"total_ms": round((t1-t0)*1000, 2)}
                 })
             
     except WebSocketDisconnect:
@@ -469,17 +375,21 @@ async def predict_with_plank(websocket: WebSocket):
 @app.websocket("/ws/pushup")
 async def websocket_pushup(websocket: WebSocket):
     """
-    WebSocket para flexiones - Enviar métricas base por frame:
+    WebSocket para flexiones - El cliente envía arrays de frames:
     {
-        "metrics": {
-            "body_angle": float,
-            "hip_shoulder_vertical_diff": float,
-            "hip_ankle_vertical_diff": float,
-            "shoulder_elbow_angle": float,
-            "wrist_shoulder_hip_angle": float,
-            "shoulder_wrist_vertical_diff": float
-        }
+        "frames": [
+            {
+                "body_angle": float,
+                "hip_shoulder_vertical_diff": float,
+                "hip_ankle_vertical_diff": float,
+                "shoulder_elbow_angle": float,
+                "wrist_shoulder_hip_angle": float,
+                "shoulder_wrist_vertical_diff": float
+            },
+            ...
+        ]
     }
+    El servidor calcula estadísticas (mean, std, min, max, range) y clasifica.
     """
     await websocket.accept()
     if "pushup" not in models:
@@ -491,15 +401,19 @@ async def websocket_pushup(websocket: WebSocket):
 @app.websocket("/ws/squat")
 async def websocket_squat(websocket: WebSocket):
     """
-    WebSocket para sentadillas - Enviar métricas base por frame:
+    WebSocket para sentadillas - El cliente envía arrays de frames:
     {
-        "metrics": {
-            "avg_knee_angle": float,
-            "avg_hip_angle": float,
-            "knee_distance": float,
-            "hip_shoulder_distance": float
-        }
+        "frames": [
+            {
+                "avg_knee_angle": float,
+                "avg_hip_angle": float,
+                "knee_distance": float,
+                "hip_shoulder_distance": float
+            },
+            ...
+        ]
     }
+    El servidor calcula estadísticas (mean, std, min, max, range) y clasifica.
     """
     await websocket.accept()
     if "squat" not in models:
@@ -511,16 +425,20 @@ async def websocket_squat(websocket: WebSocket):
 @app.websocket("/ws/plank")
 async def websocket_plank(websocket: WebSocket):
     """
-    WebSocket para planchas - Enviar métricas base por frame:
+    WebSocket para planchas - El cliente envía arrays de frames:
     {
-        "metrics": {
-            "body_angle": float,
-            "hip_shoulder_vertical_diff": float,
-            "hip_ankle_vertical_diff": float,
-            "shoulder_elbow_angle": float,
-            "wrist_shoulder_hip_angle": float
-        }
+        "frames": [
+            {
+                "body_angle": float,
+                "hip_shoulder_vertical_diff": float,
+                "hip_ankle_vertical_diff": float,
+                "shoulder_elbow_angle": float,
+                "wrist_shoulder_hip_angle": float
+            },
+            ...
+        ]
     }
+    El servidor calcula estadísticas (mean, std, min, max, range) y clasifica.
     """
     await websocket.accept()
     if "plank" not in models:
